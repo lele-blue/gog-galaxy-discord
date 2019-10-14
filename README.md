@@ -2,6 +2,7 @@
 A Gog Galxy 2 integration for discord
 
 ### DISCLAIMER: WHILE THIS INTEGRATION IS TECHNICALLY NOT VIOLATING THE DISCORD TOS, I'M NOT RESPONSIBLE FOR BANNED ACCOUNTS USING THIS INTEGRATION
+(It doesn't access the API and doesn't modify the client)
 (please also note the license)
 
 ### Please read this readme before using the integration
