@@ -17,7 +17,7 @@ Now that we got the nasty big disclaimer written in ugly caps out of our way, th
 
 Please use the download from the releases page as the repo itself does not conatain any dependencencies
 
-![Discord integration](https://i.imgur.com/BGBUPE4.png)
+![Discord integration](https://i.imgur.com/lMB0dxO.png)
 
 
 ### This integration is not affiliated with discord inc. 
