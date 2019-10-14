@@ -22,7 +22,7 @@ Please use the download from the releases page as the repo itself does not conat
 # Supported Features
 - Friend recommendations
 - Detecting installed games
-- Launching installed game
+- Launching installed games
 
 # Planned Features
 - Full discord chat (at least PMs)
