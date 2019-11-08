@@ -170,8 +170,12 @@ async def start(rec_tries=0):
 
 
 async def open_friends_page(session: CdpSession):
+    # Simulate the user clicking on the "Home" button.
     await session.execute(runtime.evaluate("""document.querySelector('a[aria-label="Home"][href]').click()"""))
+    # Simulate the user clicking on the "Friends" button.
     await session.execute(runtime.evaluate("""document.querySelector("a[href='/channels/@me']").click()"""))
+    # Navigates to the PersonWaving icon, goes up two elements, and then selects the second button (All) to show all of
+    # the user's friends.
     await session.execute(runtime.evaluate(
         """document.querySelectorAll("svg[name='PersonWaving']")[1].parentElement.parentElement.querySelectorAll
         ("div[role='button']")[2].click()"""))
