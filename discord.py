@@ -1,4 +1,4 @@
-import asyncio
+import datetime
 import json
 import logging as log
 import os
@@ -7,30 +7,35 @@ import secrets
 import subprocess
 import sys
 import webbrowser
-from threading import Thread
-from typing import Union, List, Any, Tuple
+import websocket
+from typing import List
 
 import psutil
-import trio
-from cdp import target, page, dom, runtime, network
-from cdp.dom import Node, NodeId
-from cdp.network import ResponseReceived
-from cdp.runtime import RemoteObject
 from galaxy.api.consts import LicenseType, Platform, LocalGameState
+from galaxy.api.errors import InvalidCredentials
 from galaxy.api.plugin import create_and_run_plugin, Plugin
 from galaxy.api.types import Game, LicenseInfo, FriendInfo, Authentication, LocalGame
-from trio_cdp import open_cdp_connection, CdpConnection, CdpSession
-from trio_websocket import HandshakeError
+from galaxy.http import create_client_session
 
-DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX = r"DevTools listening on ws://127\.0\.0\.1:31337/devtools/browser/(.+)"
+DEBUGGING_PORT = 31337
+
+DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX = rf"DevTools listening on ws://127\.0\.0\.1:{DEBUGGING_PORT}/devtools/browser/" \
+                                       rf"(.+)"
+
+IS_WINDOWS = (sys.platform == "win32")
 
 LOG_SENSITIVE_DATA = False
 
 RESTART_DISCORD = True
 
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.87 "
+              "Safari/537.36")
+
 devtools_url = None
 
 returned_from_trio_run = None
+
+ws_url = None
 
 
 class DiscordPlugin(Plugin):
@@ -39,7 +44,7 @@ class DiscordPlugin(Plugin):
         return self.games
 
     async def get_local_games(self) -> List[LocalGame]:
-        await self.ensure_discord_scraped()
+        # await self.ensure_discord_scraped()
         local_games = []
         for game in self.games:
             local_games.append(LocalGame(game_id=game.game_id, local_game_state=LocalGameState.Installed))
@@ -56,7 +61,7 @@ class DiscordPlugin(Plugin):
     def __init__(self, reader, writer, token):
         super().__init__(
             Platform.Discord,  # Choose platform from available list
-            "0.1",  # Version
+            "0.1.1",  # Version
             reader,
             writer,
             token
@@ -65,9 +70,6 @@ class DiscordPlugin(Plugin):
         self.games = []
         self.friends = []
         self.user_email = ""
-
-        if not devtools_url:
-            prepare_and_discover_discord()
 
     async def ensure_discord_scraped(self):
         # This is not a sufficient check. Suppose that the user adds a new friend after being authenticated with the
@@ -83,22 +85,29 @@ class DiscordPlugin(Plugin):
 
     async def scrape_discord(self):
         global returned_from_trio_run
-        t = Thread(target=run_trio_start)
-        t.start()
-        while 1:
-            if returned_from_trio_run is not None:
-                log.debug(returned_from_trio_run)
-                await asyncio.sleep(1)
-                log.debug(returned_from_trio_run)
-                self.user_email = str(returned_from_trio_run[2])[1:-1]
-                self.games = returned_from_trio_run[0]
-                self.friends = returned_from_trio_run[1]
-                return
-            await asyncio.sleep(1)
+        await start()
+        log.debug(returned_from_trio_run)
+        self.user_email = str(returned_from_trio_run[2])[1:-1]
+        self.games = returned_from_trio_run[0]
+        self.friends = returned_from_trio_run[1]
 
     # implement methods
     async def authenticate(self, stored_credentials=None):
-        await self.ensure_discord_scraped()
+        if not stored_credentials:
+            log.debug("DISCORD_RESTART: Restarting Discord...")
+            await prepare_and_discover_discord()
+            await get_ws_url()
+            try:
+                await self.scrape_discord()
+            except Exception:
+                log.exception("DISCORD_AUTH_FAILURE: A critical exception was thrown when scraping the Discord client.")
+                raise InvalidCredentials()
+            if self.user_email:
+                self.store_credentials({"user_email": self.user_email})
+            else:
+                raise InvalidCredentials()
+        else:
+            self.user_email = stored_credentials["user_email"]
         return Authentication(self.user_email, self.user_email)
 
 
@@ -106,17 +115,38 @@ def main():
     create_and_run_plugin(DiscordPlugin, sys.argv)
 
 
-def prepare_and_discover_discord():
+async def get_ws_url():
+    global ws_url
+    async with create_client_session() as session:
+        log.debug("DISCORD_WS_CHECK: Retrieving the WebSocket debugger URL...")
+        headers = {
+            "User-Agent": USER_AGENT
+        }
+        resp = await session.get(f"http://localhost:{DEBUGGING_PORT}/json/list?t="
+                                 f"{str(int(datetime.datetime.now().timestamp()))}", headers=headers)
+        resp_json = await resp.json()
+        ws_url = resp_json[0]["webSocketDebuggerUrl"]
+        log.debug(f"DISCORD_WS_FOUND: Got WebSocket debugger URL {ws_url}!")
+        # begin_url = f"http://localhost:{DEBUGGING_PORT}/devtools/inspector.html?ws={ws_url[5:]}"
+
+
+async def prepare_and_discover_discord():
     global devtools_url
     for proc in psutil.process_iter():
         if not proc.is_running():
             continue
-        if proc.name() == "Discord.exe":
+        if proc.name() == ("Discord.exe" if IS_WINDOWS else "Discord.app"):  # This should provide Mac compatibility.
             if len(proc.cmdline()) < 3 or RESTART_DISCORD:
                 if len(proc.cmdline()) == 1 or (RESTART_DISCORD and len(proc.cmdline()) == 2):
                     path = proc.exe()
                     proc.kill()
-                    process = subprocess.Popen([path, "--remote-debugging-port=31337"], stderr=subprocess.PIPE)
+                    process = subprocess.Popen(path + f" --remote-debugging-port={DEBUGGING_PORT}",
+                                               stderr=subprocess.PIPE, shell=True)
+                    # Despite the documentation for subprocess.Popen stating that shell=True is not required for
+                    # launching an application, it is required here for making sure that the remote debugging launch
+                    # parameter is used. I am unsure of why this is necessary. Perhaps Discord or Google prevented
+                    # remote debugging unless the process is launched directly from the shell of the operating system?
+
                     while True:
                         output = process.stderr.readline()
                         if output == '' and process.poll() is not None:
@@ -125,68 +155,76 @@ def prepare_and_discover_discord():
                             line = str(output.strip(), encoding="UTF8")
                             if re.match(DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX, line):
                                 devtools_url = re.search(DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX, line)[1]
-                                print(devtools_url)
+                                log.debug(f"DISCORD_DEVTOOLS_URL: {devtools_url}")
                                 break
-
-                    rc = process.poll()
-                    continue
-                if proc.cmdline()[1] == "--remote-debugging-port=31337":
-                    pass
+                    process.poll()
+                    log.debug(f"DISCORD_RESTART_FINISHED: The Discord client has been successfully launched with remote"
+                              f" debugging enabled on port {DEBUGGING_PORT}!")
+                    return
+                if proc.cmdline()[1] == f"--remote-debugging-port={DEBUGGING_PORT}":
+                    return
 
 
 async def start(rec_tries=0):
     if rec_tries > 100:
-        raise SystemExit("Max retries reached")
+        log.debug("DISCORD_SCRAPE_FAILED: The maximum number of retries has been reached.")
+        raise InvalidCredentials()
     global returned_from_trio_run
     # await trio.sleep(10)
-    try:
-        async with open_cdp_connection(
-                "ws://127.0.0.1:31337/devtools/browser/" + devtools_url) as conn:  # type: CdpConnection
-            targets = await conn.execute(target.get_targets())
-            target_id = targets[0].id
-            session = await conn.open_session(target_id)
-
-            # Navigate to a website.
-            await session.execute(page.enable())
-            # async with session.wait_for(page.LoadEventFired):
-            #    ...  # await session.execute(page.navigate(target_url))
-
-            '''
-            Is this even necessary? What exactly is the page title being used for?
-             # Extract the page title.
-            root_node = await session.execute(dom.get_document())
-            title_node_id = await session.execute(dom.query_selector(root_node.node_id, 'title'))
-            html = await session.execute(dom.get_outer_html(title_node_id))
-            print(html)
-            '''
-
-            await trio.sleep(5)
-
-            returned_from_trio_run = (await get_games(session), await get_friends(session), await
-                                      get_user_email(session))
-    except HandshakeError:
-        await trio.sleep(2)
-        return await start(rec_tries+1)
+    ws = websocket.WebSocket()
+    ws.connect(ws_url)
+    returned_from_trio_run = (await get_games(ws), await get_friends(ws), await get_user_email(ws))
 
 
-async def open_friends_page(session: CdpSession):
+async def open_friends_page(ws: websocket.WebSocket):
     # Simulate the user clicking on the "Home" button.
-    await session.execute(runtime.evaluate("""document.querySelector('a[aria-label="Home"][href]').click()"""))
+    msg = runtime_evaluate_json(r"document.querySelector('a[aria-label=\"Home\"][href]').click()")
+    ws.send(msg)
+    ws.recv()
     # Simulate the user clicking on the "Friends" button.
-    await session.execute(runtime.evaluate("""document.querySelector("a[href='/channels/@me']").click()"""))
+    msg = runtime_evaluate_json(r"document.querySelector(\"a[href='/channels/@me']\").click()")
+    ws.send(msg)
+    ws.recv()
     # Navigates to the PersonWaving icon, goes up two elements, and then selects the second button (All) to show all of
     # the user's friends.
-    await session.execute(runtime.evaluate(
-        """document.querySelectorAll("svg[name='PersonWaving']")[1].parentElement.parentElement.querySelectorAll
-        ("div[role='button']")[2].click()"""))
+    msg = runtime_evaluate_json(r"document.querySelectorAll(\"svg[name='PersonWaving']\")[1].parentElement."
+                                r"parentElement.querySelectorAll(\"div[role='button']\")[2].click()")
+    ws.send(msg)
+    ws.recv()
 
 
-async def get_data_from_local_cache(session: CdpSession, data: str):
+def create_ws_json(method: str, params=None):
+    if params is None:
+        return rf"""
+                {{
+                    "id": 1,
+                    "method": "{method}"
+                }}
+                """
+
+    return rf"""
+            {{
+                "id": 1,
+                "method": "{method}",
+                "params": {params}
+            }}
+            """
+
+
+def runtime_evaluate_json(expression: str):
+    return create_ws_json("Runtime.evaluate", rf'''
+    {{
+        "expression": "{expression}"
+    }}
+    ''')
+
+
+async def get_data_from_local_cache(ws: websocket.WebSocket, data: str):
     nonce = secrets.token_urlsafe(20).replace("-", "_")
     # reconstruct the localStorage object that discord has hidden from me to extract games
     # code borrowed from https://stackoverflow.com/a/53773662/6508769 TYSM for the answer it saved me :P
     # modified to not modify the client and not to break any TOS
-    a: Union[Tuple[RemoteObject], Any] = await session.execute(runtime.evaluate(f"""
+    msg = runtime_evaluate_json(f"""
             (function () {{
               function g_{nonce}() {{
                   const iframe = document.createElement('iframe');
@@ -196,13 +234,22 @@ async def get_data_from_local_cache(session: CdpSession, data: str):
                   return pd;
                 }};
             return g_{nonce}().get.apply().{data}      
-        }})()"""))
-    return a[0].value
+        }})()""")
+    log.debug("DISCORD_LOCAL_STORAGE_REQUEST: " + str(msg))
+    ws.send(msg)
+    while True:
+        resp = ws.recv()
+        if 'result' in json.loads(resp):
+            resp_dict = json.loads(resp)
+            break
+    if LOG_SENSITIVE_DATA:
+        log.debug(f"DISCORD_RESPONSE_FOR_{data}: {str(resp_dict)}")
+    return resp_dict['result']['result']['value']
 
 
-async def get_user_email(session: CdpSession):
+async def get_user_email(ws: websocket.WebSocket):
     log.debug("DISCORD_SCRAPE_EMAIL: Scraping the user's e-mail from the Discord client...")
-    email = await get_data_from_local_cache(session, "email_cache")
+    email = await get_data_from_local_cache(ws, "email_cache")
     if LOG_SENSITIVE_DATA:
         log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)} was found from the "
                   f"Discord client!")
@@ -212,43 +259,98 @@ async def get_user_email(session: CdpSession):
     return email
 
 
-async def get_games(session: CdpSession):
+async def get_games(ws: websocket.WebSocket):
     log.debug("DISCORD_SCRAPE_GAMES: Scraping the user's games from the Discord client...")
     games = []
-    games_json = await get_data_from_local_cache(session, "InstallationManagerStore")
+    games_json = await get_data_from_local_cache(ws, "InstallationManagerStore")
     if not json.loads(games_json)["_state"]["installationPaths"]:
         log.debug("DISCORD_SCRAPED_GAMES: [] (The user has no games on Discord!)")
         return []
 
     games_string = ""
     for path in json.loads(games_json)["_state"]["installationPaths"]:
-        for folder in os.path.os.listdir(path):
-            if os.path.isdir(os.path.join(path, folder)):
-                info_file_path = os.path.join(os.path.join(path, folder, "application_info.json"))
-                if os.path.isfile(info_file_path):
-                    app_info = json.loads(open(info_file_path).read())
-                    games.append(Game(app_info["application_id"], app_info["name"], [],
-                                      LicenseInfo(LicenseType.SinglePurchase)))
-                    games_string += (str(app_info["name"]) + ", ")
-    log.debug(f"DISCORD_SCRAPED_GAMES: [{games_string[-1:]}]")
+        if os.path.isdir(path):
+            for folder in os.path.os.listdir(path):
+                if os.path.isdir(os.path.join(path, folder)):
+                    info_file_path = os.path.join(os.path.join(path, folder, "application_info.json"))
+                    if os.path.isfile(info_file_path):
+                        app_info = json.loads(open(info_file_path).read())
+                        games.append(Game(app_info["application_id"], app_info["name"], [],
+                                          LicenseInfo(LicenseType.SinglePurchase)))
+                        games_string += (str(app_info["name"]) + ", ")
+    log.debug(f"DISCORD_SCRAPED_GAMES: [{games_string[:-2]}]")
     return games
 
 
-async def get_friends(session: CdpSession):
+async def get_friends(ws: websocket.WebSocket):
     log.debug("DISCORD_SCRAPE_FRIENDS: Scraping the user's friends from the Discord client...")
-    await open_friends_page(session)
-    root_node: Union[Node, dict] = await session.execute(dom.get_document())
-    friend_node_ids: Union[Any, List[NodeId]] = await session.execute(
-        dom.query_selector_all(root_node.node_id, "div[class^='friendsRow']"))
+    await open_friends_page(ws)
+    msg = create_ws_json("DOM.getDocument")
+    ws.send(msg)
+    root_node = ws.recv()
+    root_node_id = json.loads(root_node)['result']['root']['nodeId']
+    msg = create_ws_json("DOM.querySelectorAll", rf'''
+        {{
+            "nodeId": {root_node_id},
+            "selector": "div[class^='friendsRow']"
+        }}
+    ''')
+    ws.send(msg)
+    while True:
+        resp = ws.recv()
+        if 'result' in json.loads(resp):
+            friend_node_ids = json.loads(resp)['result']['nodeIds']
+            break
     friends = []
     for friend_node_id in friend_node_ids:
-        username_node_id: Union[NodeId, Any] = await session.execute(
-            dom.query_selector(friend_node_id, "span[class^='username-']"))
-        username = await session.execute(dom.get_outer_html(username_node_id))
+        msg = create_ws_json("DOM.querySelector", rf'''
+        {{
+            "nodeId": {friend_node_id},
+            "selector": "span[class^='username-']"
+        }}
+        ''')
+        ws.send(msg)
+        while True:
+            resp = ws.recv()
+            if 'result' in json.loads(resp):
+                username_node_id = json.loads(resp)['result']['nodeId']
+                break
+        msg = create_ws_json("DOM.getOuterHTML", rf'''
+        {{
+            "nodeId": {username_node_id}
+        }}
+        ''')
+        ws.send(msg)
+        while True:
+            resp = ws.recv()
+            if 'result' in json.loads(resp):
+                username = json.loads(resp)['result']['outerHTML']
+                break
         username = re.search(r'<span class=".+">(.+)</span>', str(username))[1]
-        discriminator_node_id: Union[NodeId, Any] = await session.execute(
-            dom.query_selector(friend_node_id, "span[class^='discriminator-']"))
-        discriminator = await session.execute(dom.get_outer_html(discriminator_node_id))
+
+        msg = create_ws_json("DOM.querySelector", rf'''
+        {{
+            "nodeId": {friend_node_id},
+            "selector": "span[class^='discriminator-']"
+         }}
+         ''')
+        ws.send(msg)
+        while True:
+            resp = ws.recv()
+            if 'result' in json.loads(resp):
+                discriminator_node_id = json.loads(resp)['result']['nodeId']
+                break
+        msg = create_ws_json("DOM.getOuterHTML", rf'''
+                {{
+                    "nodeId": {discriminator_node_id}
+                }}
+                ''')
+        ws.send(msg)
+        while True:
+            resp = ws.recv()
+            if 'result' in json.loads(resp):
+                discriminator = json.loads(resp)['result']['outerHTML']
+                break
         discriminator = re.search(r'<span class=".+">#(.+)</span>', str(discriminator))[1]
         if LOG_SENSITIVE_DATA:
             log.debug(f"DISCORD_FRIEND: Found {username} (Discriminator: {discriminator})")
@@ -258,10 +360,6 @@ async def get_friends(session: CdpSession):
     log.debug("DISCORD_SCRAPE_FRIENDS_FINISHED: The user's list of friends was successfully found from the Discord "
               "client!")
     return friends
-
-
-def run_trio_start():
-    trio.run(start, restrict_keyboard_interrupt_to_checkpoints=False)
 
 
 # run plugin event loop
