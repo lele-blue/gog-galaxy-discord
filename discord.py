@@ -90,6 +90,8 @@ class DiscordPlugin(Plugin):
         self.user_email = str(returned_from_trio_run[2])[1:-1]
         self.games = returned_from_trio_run[0]
         self.friends = returned_from_trio_run[1]
+        kill_command = "taskkill /im Discord.exe" if IS_WINDOWS else "killall -KILL Discord"
+        subprocess.Popen(kill_command)
 
     # implement methods
     async def authenticate(self, stored_credentials=None):
@@ -140,24 +142,17 @@ async def prepare_and_discover_discord():
                 if len(proc.cmdline()) == 1 or (RESTART_DISCORD and len(proc.cmdline()) == 2):
                     path = proc.exe()
                     proc.kill()
-                    process = subprocess.Popen(path + f" --remote-debugging-port={DEBUGGING_PORT}",
-                                               stderr=subprocess.PIPE, shell=True)
-                    # Despite the documentation for subprocess.Popen stating that shell=True is not required for
-                    # launching an application, it is required here for making sure that the remote debugging launch
-                    # parameter is used. I am unsure of why this is necessary. Perhaps Discord or Google prevented
-                    # remote debugging unless the process is launched directly from the shell of the operating system?
-
+                    process = subprocess.Popen([path, f"--remote-debugging-port={DEBUGGING_PORT}"],
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                     while True:
-                        output = process.stderr.readline()
-                        if output == '' and process.poll() is not None:
+                        output = process.stdout.readline().decode("UTF-8")
+                        log.debug("Line: " + output)
+                        if output == "" and process.poll() is not None:
                             break
-                        if output:
-                            line = str(output.strip(), encoding="UTF8")
-                            if re.match(DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX, line):
-                                devtools_url = re.search(DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX, line)[1]
-                                log.debug(f"DISCORD_DEVTOOLS_URL: {devtools_url}")
-                                break
-                    process.poll()
+                        if output.startswith("DevTools listening on"):
+                            devtools_url = re.search(DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX, output)
+                            log.debug(f"DISCORD_DEVTOOLS_URL: {devtools_url}")
+                            break
                     log.debug(f"DISCORD_RESTART_FINISHED: The Discord client has been successfully launched with remote"
                               f" debugging enabled on port {DEBUGGING_PORT}!")
                     return
@@ -251,10 +246,10 @@ async def get_user_email(ws: websocket.WebSocket):
     log.debug("DISCORD_SCRAPE_EMAIL: Scraping the user's e-mail from the Discord client...")
     email = await get_data_from_local_cache(ws, "email_cache")
     if LOG_SENSITIVE_DATA:
-        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)} was found from the "
+        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email[1:-1])} was found from the "
                   f"Discord client!")
     else:
-        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)[:1]}*** was found from "
+        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)[1:2]}*** was found from "
                   f"the Discord client!")
     return email
 
