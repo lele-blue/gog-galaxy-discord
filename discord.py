@@ -1,6 +1,6 @@
 import asyncio
 import json
-import logging
+import logging as log
 import os
 import re
 import secrets
@@ -23,6 +23,8 @@ from trio_cdp import open_cdp_connection, CdpConnection, CdpSession
 from trio_websocket import HandshakeError
 
 DEVTOOLS_BROWSER_LAUNCH_OUTPUT_REGEX = r"DevTools listening on ws://127\.0\.0\.1:31337/devtools/browser/(.+)"
+
+LOG_SENSITIVE_DATA = False
 
 RESTART_DISCORD = True
 
@@ -68,6 +70,14 @@ class DiscordPlugin(Plugin):
             prepare_and_discover_discord()
 
     async def ensure_discord_scraped(self):
+        # This is not a sufficient check. Suppose that the user adds a new friend after being authenticated with the
+        # Discord client. This new friend would not appear unless the client was scraped again, since self.user_email
+        # is already defined. (A similar situation occurs with games.)
+
+        # The only way to ensure that the information remains relevant is to continue to scrape the Discord client
+        # afterwards. (Alternatively, if you are feeling lazy, another "solution" would be to disconnect the user from
+        # the plugin after some time (such as by raising InvalidCredentials()). This is obviously not a preferable
+        # solution, since having to constantly relaunch Discord is inconvenient for the user.)
         if not self.user_email:
             await self.scrape_discord()
 
@@ -77,9 +87,9 @@ class DiscordPlugin(Plugin):
         t.start()
         while 1:
             if returned_from_trio_run is not None:
-                logging.debug(returned_from_trio_run)
+                log.debug(returned_from_trio_run)
                 await asyncio.sleep(1)
-                logging.debug(returned_from_trio_run)
+                log.debug(returned_from_trio_run)
                 self.user_email = str(returned_from_trio_run[2])[1:-1]
                 self.games = returned_from_trio_run[0]
                 self.friends = returned_from_trio_run[1]
@@ -133,7 +143,7 @@ async def start(rec_tries=0):
         async with open_cdp_connection(
                 "ws://127.0.0.1:31337/devtools/browser/" + devtools_url) as conn:  # type: CdpConnection
             targets = await conn.execute(target.get_targets())
-            target_id = targets[0].target_id
+            target_id = targets[0].id
             session = await conn.open_session(target_id)
 
             # Navigate to a website.
@@ -141,16 +151,19 @@ async def start(rec_tries=0):
             # async with session.wait_for(page.LoadEventFired):
             #    ...  # await session.execute(page.navigate(target_url))
 
-            # Extract the page title.
+            '''
+            Is this even necessary? What exactly is the page title being used for?
+             # Extract the page title.
             root_node = await session.execute(dom.get_document())
-            title_node_id = await session.execute(dom.query_selector(root_node.node_id,
-                                                                     'title'))
+            title_node_id = await session.execute(dom.query_selector(root_node.node_id, 'title'))
             html = await session.execute(dom.get_outer_html(title_node_id))
             print(html)
+            '''
 
             await trio.sleep(5)
 
-            returned_from_trio_run = (await get_games(session), await get_friends(session), await get_user_email(session))
+            returned_from_trio_run = (await get_games(session), await get_friends(session), await
+                                      get_user_email(session))
     except HandshakeError:
         await trio.sleep(2)
         return await start(rec_tries+1)
@@ -160,60 +173,65 @@ async def open_friends_page(session: CdpSession):
     await session.execute(runtime.evaluate("""document.querySelector('a[aria-label="Home"][href]').click()"""))
     await session.execute(runtime.evaluate("""document.querySelector("a[href='/channels/@me']").click()"""))
     await session.execute(runtime.evaluate(
-        """document.querySelectorAll("svg[name='PersonWaving']")[1].parentElement.parentElement.querySelectorAll("div[role='button']")[2].click()"""))
+        """document.querySelectorAll("svg[name='PersonWaving']")[1].parentElement.parentElement.querySelectorAll
+        ("div[role='button']")[2].click()"""))
+
+
+async def get_data_from_local_cache(session: CdpSession, data: str):
+    nonce = secrets.token_urlsafe(20).replace("-", "_")
+    # reconstruct the localStorage object that discord has hidden from me to extract games
+    # code borrowed from https://stackoverflow.com/a/53773662/6508769 TYSM for the answer it saved me :P
+    # modified to not modify the client and not to break any TOS
+    a: Union[Tuple[RemoteObject], Any] = await session.execute(runtime.evaluate(f"""
+            (function () {{
+              function g_{nonce}() {{
+                  const iframe = document.createElement('iframe');
+                  document.body.append(iframe);
+                  const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
+                  iframe.remove();
+                  return pd;
+                }};
+            return g_{nonce}().get.apply().{data}      
+        }})()"""))
+    return a[0].value
 
 
 async def get_user_email(session: CdpSession):
-    nonce = secrets.token_urlsafe(20).replace("-", "_")
-    # reconstruct the localStorage object that discord has hidden from me to extract games
-    # code borrowed from https://stackoverflow.com/a/53773662/6508769 TYSM for the answer it saved me :P
-    # modified to not modify the client and not to break any TOS
-    a: Union[Tuple[RemoteObject], Any] = await session.execute(runtime.evaluate(f"""
-        (function () {{
-          function g_{nonce}() {{
-              const iframe = document.createElement('iframe');
-              document.body.append(iframe);
-              const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
-              iframe.remove();
-              return pd;
-            }};
-        return g_{nonce}().get.apply().email_cache       
-    }})()"""))
+    log.debug("DISCORD_SCRAPE_EMAIL: Scraping the user's e-mail from the Discord client...")
+    email = await get_data_from_local_cache(session, "email_cache")
+    if LOG_SENSITIVE_DATA:
+        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)} was found from the "
+                  f"Discord client!")
+    else:
+        log.debug(f"DISCORD_SCRAPE_EMAIL_FINISHED: The user's e-mail address {str(email)[:1]}*** was found from "
+                  f"the Discord client!")
+    return email
 
-    return a[0].value
 
 async def get_games(session: CdpSession):
-    nonce = secrets.token_urlsafe(20).replace("-", "_")
-    # reconstruct the localStorage object that discord has hidden from me to extract games
-    # code borrowed from https://stackoverflow.com/a/53773662/6508769 TYSM for the answer it saved me :P
-    # modified to not modify the client and not to break any TOS
-    a: Union[Tuple[RemoteObject], Any] = await session.execute(runtime.evaluate(f"""
-        (function () {{
-          function g_{nonce}() {{
-              const iframe = document.createElement('iframe');
-              document.body.append(iframe);
-              const pd = Object.getOwnPropertyDescriptor(iframe.contentWindow, 'localStorage');
-              iframe.remove();
-              return pd;
-            }};
-        return g_{nonce}().get.apply().InstallationManagerStore       
-    }})()"""))
-
+    log.debug("DISCORD_SCRAPE_GAMES: Scraping the user's games from the Discord client...")
     games = []
+    games_json = await get_data_from_local_cache(session, "InstallationManagerStore")
+    if not json.loads(games_json)["_state"]["installationPaths"]:
+        log.debug("DISCORD_SCRAPED_GAMES: [] (The user has no games on Discord!)")
+        return []
 
-    for path in json.loads(a[0].value)["_state"]["installationPaths"]:
+    games_string = ""
+    for path in json.loads(games_json)["_state"]["installationPaths"]:
         for folder in os.path.os.listdir(path):
             if os.path.isdir(os.path.join(path, folder)):
                 info_file_path = os.path.join(os.path.join(path, folder, "application_info.json"))
                 if os.path.isfile(info_file_path):
                     app_info = json.loads(open(info_file_path).read())
-                    games.append(Game(app_info["application_id"], app_info["name"], [], LicenseInfo(LicenseType.SinglePurchase)))
-
+                    games.append(Game(app_info["application_id"], app_info["name"], [],
+                                      LicenseInfo(LicenseType.SinglePurchase)))
+                    games_string += (str(app_info["name"]) + ", ")
+    log.debug(f"DISCORD_SCRAPED_GAMES: [{games_string[-1:]}]")
     return games
 
 
-
 async def get_friends(session: CdpSession):
+    log.debug("DISCORD_SCRAPE_FRIENDS: Scraping the user's friends from the Discord client...")
     await open_friends_page(session)
     root_node: Union[Node, dict] = await session.execute(dom.get_document())
     friend_node_ids: Union[Any, List[NodeId]] = await session.execute(
@@ -228,8 +246,13 @@ async def get_friends(session: CdpSession):
             dom.query_selector(friend_node_id, "span[class^='discriminator-']"))
         discriminator = await session.execute(dom.get_outer_html(discriminator_node_id))
         discriminator = re.search(r'<span class=".+">#(.+)</span>', str(discriminator))[1]
+        if LOG_SENSITIVE_DATA:
+            log.debug(f"DISCORD_FRIEND: Found {username} (Discriminator: {discriminator})")
+        else:
+            log.debug(f"DISCORD_FRIEND: Found {username[:1]}*** (Discriminator: ***)")
         friends.append(FriendInfo(f"{username}#{discriminator}", username))
-
+    log.debug("DISCORD_SCRAPE_FRIENDS_FINISHED: The user's list of friends was successfully found from the Discord "
+              "client!")
     return friends
 
 
