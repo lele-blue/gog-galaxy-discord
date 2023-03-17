@@ -15,7 +15,7 @@ Now that we got the nasty big disclaimer written in ugly caps out of our way, th
 4. Click connect and wait until the integration collects all the data it needs
  (This will open the friends page in discord)
 
-Please use the download from the releases page as the repo itself does not conatain any dependencencies
+Please use the download (from the releases page)[https://github.com/Ertego/gog-galaxy-discord/releases/tag/0.1] as the repo itself does not conatain any dependencencies
 
 ![Discord integration](https://i.imgur.com/lMB0dxO.png)
 
