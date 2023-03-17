@@ -1,3 +1,5 @@
+Update: Since discord stopped selling games, this plugin will no longer be updated or maintained
+
 # gog-galaxy-discord
 A Gog Galxy 2 integration for discord
 
