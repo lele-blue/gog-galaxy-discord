@@ -19,6 +19,16 @@ Please use the download from the releases page as the repo itself does not conat
 
 ![Discord integration](https://i.imgur.com/lMB0dxO.png)
 
+# Supported Features
+- Friend recommendations
+- Detecting installed games
+- Launching installed game
+
+# Planned Features
+- Full discord chat (at least PMs)
+- Installing not yet installed games
+- Better User Experience
+
 
 ### This integration is not affiliated with discord inc. 
 
